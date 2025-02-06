@@ -156,7 +156,7 @@ impl MockMainPod {
         }
     }
 
-    fn process_priavte_statements_operations(
+    fn process_private_statement_operations(
         params: &Params,
         statements: &[Statement],
         input_operations: &[middleware::Operation],
@@ -179,7 +179,7 @@ impl MockMainPod {
 
     // NOTE: In this implementation public statements are always copies from previous statements,
     // so we fill in the operations accordingly.
-    fn process_public_statements_operations(
+    fn process_public_statement_operations(
         params: &Params,
         statements: &[Statement],
         mut operations: Vec<Operation>,
@@ -207,14 +207,14 @@ impl MockMainPod {
     pub fn new(params: &Params, inputs: MainPodInputs) -> Result<Self> {
         // TODO: Figure out a way to handle public statements.  For example, in the public slots
         // use copy operations taking the private statements that need to be public.  We may change
-        // the MainPodInputs type to accomodate for that.
+        // the MainPodInputs type to accommodate for that.
         // TODO: Insert a new public statement of ValueOf with `key=KEY_TYPE,
         // value=PodType::MockMainPod`
         let statements = Self::layout_statements(params, &inputs);
         let operations =
-            Self::process_priavte_statements_operations(params, &statements, inputs.operations);
+            Self::process_private_statement_operations(params, &statements, inputs.operations);
         let operations =
-            Self::process_public_statements_operations(params, &statements, operations);
+            Self::process_public_statement_operations(params, &statements, operations);
 
         let input_signed_pods = inputs
             .signed_pods
