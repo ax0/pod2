@@ -22,14 +22,14 @@ pub enum OperationType {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OperationAux {
     None,
-    MerkleProof(MerkleProof),
+    MerkleProof(bool, MerkleProof),
 }
 
 impl fmt::Display for OperationAux {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::None => write!(f, "<no aux>")?,
-            Self::MerkleProof(pf) => write!(f, "merkle_proof({})", pf)?,
+            Self::MerkleProof(_, pf) => write!(f, "merkle_proof({})", pf)?,
         }
         Ok(())
     }
@@ -153,12 +153,12 @@ pub enum Operation {
         /* root  */ Statement,
         /* key   */ Statement,
         /* value */ Statement,
-        /* proof */ MerkleProof,
+        /* proof */ (bool, MerkleProof),
     ),
     NotContainsFromEntries(
         /* root  */ Statement,
         /* key   */ Statement,
-        /* proof */ MerkleProof,
+        /* proof */ (bool, MerkleProof),
     ),
     SumOf(Statement, Statement, Statement),
     ProductOf(Statement, Statement, Statement),
@@ -231,8 +231,12 @@ impl Operation {
     /// Extracts auxiliary data from operation.
     pub fn aux(&self) -> OperationAux {
         match self {
-            Self::ContainsFromEntries(_, _, _, mp) => OperationAux::MerkleProof(mp.clone()),
-            Self::NotContainsFromEntries(_, _, mp) => OperationAux::MerkleProof(mp.clone()),
+            Self::ContainsFromEntries(_, _, _, (ind, mp)) => {
+                OperationAux::MerkleProof(*ind, mp.clone())
+            }
+            Self::NotContainsFromEntries(_, _, (ind, mp)) => {
+                OperationAux::MerkleProof(*ind, mp.clone())
+            }
             _ => OperationAux::None,
         }
     }
@@ -258,11 +262,11 @@ impl Operation {
                 (NO::LtFromEntries, &[s1, s2], OA::None) => {
                     Self::LtFromEntries(s1.clone(), s2.clone())
                 }
-                (NO::ContainsFromEntries, &[s1, s2, s3], OA::MerkleProof(pf)) => {
-                    Self::ContainsFromEntries(s1.clone(), s2.clone(), s3.clone(), pf)
+                (NO::ContainsFromEntries, &[s1, s2, s3], OA::MerkleProof(ind, pf)) => {
+                    Self::ContainsFromEntries(s1.clone(), s2.clone(), s3.clone(), (ind, pf))
                 }
-                (NO::NotContainsFromEntries, &[s1, s2], OA::MerkleProof(pf)) => {
-                    Self::NotContainsFromEntries(s1.clone(), s2.clone(), pf)
+                (NO::NotContainsFromEntries, &[s1, s2], OA::MerkleProof(ind, pf)) => {
+                    Self::NotContainsFromEntries(s1.clone(), s2.clone(), (ind, pf))
                 }
                 (NO::SumOf, &[s1, s2, s3], OA::None) => {
                     Self::SumOf(s1.clone(), s2.clone(), s3.clone())

@@ -26,9 +26,9 @@ use crate::{
         STANDARD_REC_MAIN_POD_CIRCUIT_DATA,
     },
     middleware::{
-        self, resolve_wildcard_values, value_from_op, AnchoredKey, CustomPredicateBatch, Hash,
-        MainPodInputs, NativeOperation, OperationType, Params, Pod, PodId, PodProver, PodType,
-        RecursivePod, StatementArg, ToFields, VDSet, F, KEY_TYPE, SELF,
+        self, hash_value, resolve_wildcard_values, value_from_op, AnchoredKey,
+        CustomPredicateBatch, Hash, MainPodInputs, NativeOperation, OperationType, Params, Pod,
+        PodId, PodProver, PodType, RecursivePod, StatementArg, ToFields, VDSet, F, KEY_TYPE, SELF,
     },
     timed,
 };
@@ -127,37 +127,61 @@ pub(crate) fn extract_merkle_proofs(
     params: &Params,
     operations: &[middleware::Operation],
     statements: &[middleware::Statement],
-) -> Result<Vec<MerkleClaimAndProof>> {
+) -> Result<Vec<(bool, MerkleClaimAndProof)>> {
     assert_eq!(operations.len(), statements.len());
+    // Pair Merkle proofs with their corresponding roots, keys and
+    // values, hashing the latter two if necessary.
     let merkle_proofs: Vec<_> = operations
         .iter()
         .zip(statements.iter())
         .flat_map(|(op, st)| match (op, st) {
             (
-                middleware::Operation::ContainsFromEntries(root_s, key_s, value_s, pf),
+                middleware::Operation::ContainsFromEntries(root_s, key_s, value_s, (ind, pf)),
                 middleware::Statement::Contains(root_ref, key_ref, value_ref),
             ) => {
                 let root = value_from_op(root_s, root_ref)?;
-                let key = value_from_op(key_s, key_ref)?;
-                let value = value_from_op(value_s, value_ref)?;
-                Some(MerkleClaimAndProof::new(
-                    Hash::from(root.raw()),
-                    key.raw(),
-                    Some(value.raw()),
-                    pf.clone(),
+                let key = {
+                    let key_from_op = value_from_op(key_s, key_ref)?;
+                    if *ind {
+                        hash_value(&key_from_op.raw()).into()
+                    } else {
+                        key_from_op
+                    }
+                };
+                let value = {
+                    let value_from_op = value_from_op(value_s, value_ref)?;
+                    if *ind {
+                        hash_value(&value_from_op.raw()).into()
+                    } else {
+                        value_from_op
+                    }
+                };
+                Some((
+                    *ind,
+                    MerkleClaimAndProof::new(
+                        Hash::from(root.raw()),
+                        key.raw(),
+                        Some(value.raw()),
+                        pf.clone(),
+                    ),
                 ))
             }
             (
-                middleware::Operation::NotContainsFromEntries(root_s, key_s, pf),
+                middleware::Operation::NotContainsFromEntries(root_s, key_s, (ind, pf)),
                 middleware::Statement::NotContains(root_ref, key_ref),
             ) => {
                 let root = value_from_op(root_s, root_ref)?;
-                let key = value_from_op(key_s, key_ref)?;
-                Some(MerkleClaimAndProof::new(
-                    Hash::from(root.raw()),
-                    key.raw(),
-                    None,
-                    pf.clone(),
+                let key = {
+                    let key_from_op = value_from_op(key_s, key_ref)?;
+                    if *ind {
+                        hash_value(&key_from_op.raw()).into()
+                    } else {
+                        key_from_op
+                    }
+                };
+                Some((
+                    *ind,
+                    MerkleClaimAndProof::new(Hash::from(root.raw()), key.raw(), None, pf.clone()),
                 ))
             }
             _ => None,
@@ -197,7 +221,7 @@ fn find_op_arg(statements: &[Statement], op_arg: &middleware::Statement) -> Resu
 // to not keep a reference to the custom predicate and instead just keep the id and index and then
 // do the same double indexing that the MainPod does to verify custom predicates.
 fn find_op_aux(
-    merkle_proofs: &[MerkleClaimAndProof],
+    merkle_proofs: &[(bool, MerkleClaimAndProof)],
     custom_predicate_verifications: Option<&[CustomPredicateVerification]>,
     op: &middleware::Operation,
 ) -> Result<OperationAux> {
@@ -223,10 +247,10 @@ fn find_op_aux(
     }
     match &op_aux {
         middleware::OperationAux::None => Ok(OperationAux::None),
-        middleware::OperationAux::MerkleProof(pf_arg) => merkle_proofs
+        middleware::OperationAux::MerkleProof(ind, pf_arg) => merkle_proofs
             .iter()
             .enumerate()
-            .find_map(|(i, pf)| (pf.proof == *pf_arg).then_some(i))
+            .find_map(|(i, pf)| ((pf.0 == *ind) && (pf.1.proof == *pf_arg)).then_some(i))
             .map(OperationAux::MerkleProofIndex)
             .ok_or(Error::custom(format!(
                 "Merkle proof corresponding to op arg {} not found",
@@ -369,7 +393,7 @@ pub(crate) fn layout_statements(
 pub(crate) fn process_private_statements_operations(
     params: &Params,
     statements: &[Statement],
-    merkle_proofs: &[MerkleClaimAndProof],
+    merkle_proofs: &[(bool, MerkleClaimAndProof)],
     custom_predicate_verifications: Option<&[CustomPredicateVerification]>,
     input_operations: &[middleware::Operation],
 ) -> Result<Vec<Operation>> {
@@ -732,11 +756,11 @@ pub mod tests {
         },
         examples::{attest_eth_friend, zu_kyc_pod_builder, zu_kyc_sign_pod_builders, EthDosHelper},
         frontend::{
-            literal, CustomPredicateBatchBuilder, MainPodBuilder, StatementTmplBuilder as STB,
-            {self},
+            self, literal, CustomPredicateBatchBuilder, MainPodBuilder, StatementTmplBuilder as STB,
         },
-        middleware,
-        middleware::{CustomPredicateRef, NativePredicate as NP, Value, DEFAULT_VD_SET},
+        middleware::{
+            self, containers::Set, CustomPredicateRef, NativePredicate as NP, Value, DEFAULT_VD_SET,
+        },
         op,
     };
 
@@ -946,6 +970,27 @@ pub mod tests {
 
         let pod = (pod.pod as Box<dyn Any>).downcast::<MainPod>().unwrap();
 
+        Ok(pod.verify()?)
+    }
+
+    #[test]
+    fn test_set_contains() -> frontend::Result<()> {
+        let params = Params::default();
+        let mut builder = MainPodBuilder::new(&params, &*DEFAULT_VD_SET);
+        let set = [1, 2, 3].into_iter().map(|n| n.into()).collect();
+        let st = builder
+            .pub_op(op!(
+                new_entry,
+                "entry",
+                Set::new(params.max_merkle_proofs_containers, set).unwrap()
+            ))
+            .unwrap();
+
+        builder.pub_op(op!(set_contains, st, 1))?;
+
+        let mut prover = Prover {};
+        let proof = builder.prove(&mut prover, &params).unwrap();
+        let pod = (proof.pod as Box<dyn Any>).downcast::<MainPod>().unwrap();
         Ok(pod.verify()?)
     }
 }

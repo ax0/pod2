@@ -266,12 +266,17 @@ impl MainPodBuilder {
                             "Invalid key argument for op {}.",
                             op
                         )))?;
-                let proof = if op_type == &Native(ContainsFromEntries) {
-                    container.prove_existence(key)?.1
+                let (hashed_value_ind, proof) = if op_type == &Native(ContainsFromEntries) {
+                    let (ind, _, pf) = container.prove_existence(key)?;
+                    (ind, pf)
                 } else {
                     container.prove_nonexistence(key)?
                 };
-                Ok(Operation(op_type.clone(), op.1, OpAux::MerkleProof(proof)))
+                Ok(Operation(
+                    op_type.clone(),
+                    op.1,
+                    OpAux::MerkleProof(hashed_value_ind, proof),
+                ))
             }
             _ => Ok(op),
         }
@@ -1085,7 +1090,7 @@ pub mod tests {
                     OperationArg::Statement(st1),
                     OperationArg::Statement(st2),
                 ],
-                OperationAux::MerkleProof(dict.prove(&Key::from("a")).unwrap().1),
+                OperationAux::MerkleProof(false, dict.prove(&Key::from("a")).unwrap().1),
             ))
             .unwrap();
         let mut main_prover = MockProver {};

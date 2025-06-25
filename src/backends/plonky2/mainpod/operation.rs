@@ -68,7 +68,7 @@ impl Operation {
     pub fn deref(
         &self,
         statements: &[Statement],
-        merkle_proofs: &[MerkleClaimAndProof],
+        merkle_proofs: &[(bool, MerkleClaimAndProof)],
     ) -> Result<crate::middleware::Operation> {
         let deref_args = self
             .1
@@ -85,13 +85,13 @@ impl Operation {
         let deref_aux = match self.2 {
             OperationAux::None => crate::middleware::OperationAux::None,
             OperationAux::CustomPredVerifyIndex(_) => crate::middleware::OperationAux::None,
-            OperationAux::MerkleProofIndex(i) => crate::middleware::OperationAux::MerkleProof(
-                merkle_proofs
+            OperationAux::MerkleProofIndex(i) => {
+                let (ind, pf) = merkle_proofs
                     .get(i)
                     .ok_or(Error::custom(format!("Missing Merkle proof index {}", i)))?
-                    .proof
-                    .clone(),
-            ),
+                    .clone();
+                crate::middleware::OperationAux::MerkleProof(ind, pf.proof)
+            }
         };
         Ok(middleware::Operation::op(
             self.0.clone(),

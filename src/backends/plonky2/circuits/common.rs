@@ -716,6 +716,19 @@ impl Flattenable for ValueTarget {
     }
 }
 
+impl<T: Flattenable> Flattenable for (BoolTarget, T) {
+    fn flatten(&self) -> Vec<Target> {
+        [vec![self.0.target], self.1.flatten()].concat()
+    }
+
+    fn from_flattened(params: &Params, vs: &[Target]) -> Self {
+        (
+            BoolTarget::new_unsafe(vs[0]),
+            T::from_flattened(params, &vs[1..]),
+        )
+    }
+}
+
 impl Flattenable for MerkleClaimTarget {
     fn flatten(&self) -> Vec<Target> {
         [

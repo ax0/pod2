@@ -10,8 +10,8 @@ use crate::{
     backends::plonky2::mock::signedpod::MockSigner,
     frontend::{MainPod, MainPodBuilder, Result, SignedPod, SignedPodBuilder},
     middleware::{
-        containers::Set, CustomPredicateRef, Params, PodSigner, PodType, Predicate, Statement,
-        StatementArg, TypedValue, VDSet, Value, KEY_SIGNER, KEY_TYPE,
+        containers::Set, hash_value, CustomPredicateRef, Params, PodSigner, PodType, Predicate,
+        Statement, StatementArg, TypedValue, VDSet, Value, KEY_SIGNER, KEY_TYPE,
     },
     op,
 };
@@ -22,8 +22,7 @@ pub fn zu_kyc_sign_pod_builders(
     params: &Params,
 ) -> (SignedPodBuilder, SignedPodBuilder, SignedPodBuilder) {
     let sanctions_values: HashSet<Value> = ["A343434340"].iter().map(|s| Value::from(*s)).collect();
-    let sanction_set =
-        Value::from(Set::new(params.max_depth_mt_containers, sanctions_values).unwrap());
+    let sanction_set = Set::new(params.max_depth_mt_containers, sanctions_values).unwrap();
 
     let mut gov_id = SignedPodBuilder::new(params);
     gov_id.insert("idNumber", "4242424242");

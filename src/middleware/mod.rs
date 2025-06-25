@@ -388,20 +388,26 @@ impl Value {
         self.raw
     }
     /// Determines Merkle existence proof for `key` in `self` (if applicable).
+    /// Includes a boolean indicating whether the key and value are hashed in
+    /// the Merkle proof.
     pub(crate) fn prove_existence<'a>(
         &'a self,
         key: &'a Value,
-    ) -> Result<(&'a Value, MerkleProof)> {
+    ) -> Result<(bool, &'a Value, MerkleProof)> {
         match &self.typed() {
             TypedValue::Array(a) => match key.typed() {
-                TypedValue::Int(i) if i >= &0 => a.prove((*i) as usize),
+                TypedValue::Int(i) if i >= &0 => {
+                    a.prove((*i) as usize).map(|(v, pf)| (false, v, pf))
+                }
                 _ => Err(Error::custom(format!(
                     "Invalid key {} for container {}.",
                     key, self
                 )))?,
             },
-            TypedValue::Dictionary(d) => d.prove(&key.typed().clone().try_into()?),
-            TypedValue::Set(s) => Ok((key, s.prove(key)?)),
+            TypedValue::Dictionary(d) => d
+                .prove(&key.typed().clone().try_into()?)
+                .map(|(v, pf)| (false, v, pf)),
+            TypedValue::Set(s) => Ok((key, s.prove(key)?)).map(|(v, pf)| (true, v, pf)),
             _ => Err(Error::custom(format!(
                 "Invalid container value {}",
                 self.typed()
@@ -409,13 +415,17 @@ impl Value {
         }
     }
     /// Determines Merkle non-existence proof for `key` in `self` (if applicable).
-    pub(crate) fn prove_nonexistence<'a>(&'a self, key: &'a Value) -> Result<MerkleProof> {
+    /// Includes a boolean indicating whether the key and value are hashed in
+    /// the Merkle proof.
+    pub(crate) fn prove_nonexistence<'a>(&'a self, key: &'a Value) -> Result<(bool, MerkleProof)> {
         match &self.typed() {
             TypedValue::Array(_) => Err(Error::custom(
                 "Arrays do not support `NotContains` operation.".to_string(),
             )),
-            TypedValue::Dictionary(d) => d.prove_nonexistence(&key.typed().clone().try_into()?),
-            TypedValue::Set(s) => s.prove_nonexistence(key),
+            TypedValue::Dictionary(d) => d
+                .prove_nonexistence(&key.typed().clone().try_into()?)
+                .map(|pf| (false, pf)),
+            TypedValue::Set(s) => s.prove_nonexistence(key).map(|pf| (true, pf)),
             _ => Err(Error::custom(format!(
                 "Invalid container value {}",
                 self.typed()

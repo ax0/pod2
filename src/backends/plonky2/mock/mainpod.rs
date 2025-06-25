@@ -53,7 +53,7 @@ pub struct MockMainPod {
     // public subset of the `statements` vector
     public_statements: Vec<Statement>,
     // All Merkle proofs
-    merkle_proofs_containers: Vec<MerkleClaimAndProof>,
+    merkle_proofs_containers: Vec<(bool, MerkleClaimAndProof)>,
 }
 
 impl PartialEq for MockMainPod {
@@ -157,7 +157,7 @@ struct Data {
     public_statements: Vec<Statement>,
     operations: Vec<Operation>,
     statements: Vec<Statement>,
-    merkle_proofs: Vec<MerkleClaimAndProof>,
+    merkle_proofs: Vec<(bool, MerkleClaimAndProof)>,
     input_signed_pods: Vec<(usize, PodId, serde_json::Value)>,
     input_recursive_pods: Vec<(usize, Params, PodId, VDSet, serde_json::Value)>,
 }

@@ -149,7 +149,7 @@ impl OperationVerifyGadget {
         op: &OperationTarget,
         prev_statements: &[StatementTarget],
         input_statements_offset: usize,
-        merkle_claims: &[MerkleClaimTarget],
+        merkle_claims: &[(BoolTarget, MerkleClaimTarget)],
         custom_predicate_verification_table: &[HashOutTarget],
     ) -> Result<()> {
         let measure = measure_gates_begin!(builder, "OpVerify");
@@ -274,7 +274,7 @@ impl OperationVerifyGadget {
         builder: &mut CircuitBuilder,
         st: &StatementTarget,
         op_type: &OperationTypeTarget,
-        resolved_merkle_claim: MerkleClaimTarget,
+        resolved_merkle_claim: (BoolTarget, MerkleClaimTarget),
         cache: &StatementCache,
     ) -> BoolTarget {
         let measure = measure_gates_begin!(builder, "OpContainsFromEntries");
@@ -284,18 +284,26 @@ impl OperationVerifyGadget {
             cache.first_n_args_as_values();
 
         // Check Merkle proof (verified elsewhere) against op args.
+        // First hash key & value if necessary.
+        let (ind, claim) = resolved_merkle_claim;
+        let key_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(key_value.elements.to_vec());
+        let value_hash =
+            builder.hash_n_to_hash_no_pad::<PoseidonHash>(value_value.elements.to_vec());
+        let expected_key = iter::zip(key_hash.elements, key_value.elements)
+            .map(|(h, v)| builder.select(ind, h, v))
+            .collect::<Vec<_>>();
+        let expected_value = iter::zip(value_hash.elements, value_value.elements)
+            .map(|(h, v)| builder.select(ind, h, v))
+            .collect::<Vec<_>>();
         let merkle_proof_checks = [
             /* The supplied Merkle proof must be enabled. */
-            resolved_merkle_claim.enabled,
+            claim.enabled,
             /* ...and it must be an existence proof. */
-            resolved_merkle_claim.existence,
+            claim.existence,
             /* ...for the root-key-value triple in the resolved op args. */
-            builder.is_equal_slice(
-                &merkle_root_value.elements,
-                &resolved_merkle_claim.root.elements,
-            ),
-            builder.is_equal_slice(&key_value.elements, &resolved_merkle_claim.key.elements),
-            builder.is_equal_slice(&value_value.elements, &resolved_merkle_claim.value.elements),
+            builder.is_equal_slice(&merkle_root_value.elements, &claim.root.elements),
+            builder.is_equal_slice(&expected_key, &claim.key.elements),
+            builder.is_equal_slice(&expected_value, &claim.value.elements),
         ];
 
         let merkle_proof_ok = builder.all(merkle_proof_checks);
@@ -322,7 +330,7 @@ impl OperationVerifyGadget {
         builder: &mut CircuitBuilder,
         st: &StatementTarget,
         op_type: &OperationTypeTarget,
-        resolved_merkle_claim: MerkleClaimTarget,
+        resolved_merkle_claim: (BoolTarget, MerkleClaimTarget),
         cache: &StatementCache,
     ) -> BoolTarget {
         let measure = measure_gates_begin!(builder, "OpNotContainsFromEntries");
@@ -331,17 +339,20 @@ impl OperationVerifyGadget {
         let (arg_types_ok, [merkle_root_value, key_value]) = cache.first_n_args_as_values();
 
         // Check Merkle proof (verified elsewhere) against op args.
+        // First hash key if necessary.
+        let (ind, claim) = resolved_merkle_claim;
+        let key_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(key_value.elements.to_vec());
+        let expected_key = iter::zip(key_hash.elements, key_value.elements)
+            .map(|(h, v)| builder.select(ind, h, v))
+            .collect::<Vec<_>>();
         let merkle_proof_checks = [
             /* The supplied Merkle proof must be enabled. */
-            resolved_merkle_claim.enabled,
+            claim.enabled,
             /* ...and it must be a nonexistence proof. */
-            builder.not(resolved_merkle_claim.existence),
+            builder.not(claim.existence),
             /* ...for the root-key pair in the resolved op args. */
-            builder.is_equal_slice(
-                &merkle_root_value.elements,
-                &resolved_merkle_claim.root.elements,
-            ),
-            builder.is_equal_slice(&key_value.elements, &resolved_merkle_claim.key.elements),
+            builder.is_equal_slice(&merkle_root_value.elements, &claim.root.elements),
+            builder.is_equal_slice(&expected_key, &claim.key.elements),
         ];
 
         let merkle_proof_ok = builder.all(merkle_proof_checks);
@@ -1315,12 +1326,17 @@ impl MainPodVerifyGadget {
             max_depth: params.max_depth_mt_containers,
         };
         let merkle_proofs: Vec<_> = (0..params.max_merkle_proofs_containers)
-            .map(|_| mp_gadget.eval(builder))
+            .map(|_| {
+                (
+                    builder.add_virtual_bool_target_safe(),
+                    mp_gadget.eval(builder),
+                )
+            })
             .collect();
         let merkle_claims: Vec<_> = merkle_proofs
             .clone()
             .into_iter()
-            .map(|pf| pf.into())
+            .map(|(ind, pf)| (ind, pf.into()))
             .collect();
 
         // Table of custom predicate batches with batch_id calculation
@@ -1399,7 +1415,7 @@ pub struct MainPodVerifyTarget {
     // The KEY_TYPE statement must be the first public one
     statements: Vec<StatementTarget>,
     operations: Vec<OperationTarget>,
-    merkle_proofs: Vec<MerkleClaimAndProofTarget>,
+    merkle_proofs: Vec<(BoolTarget, MerkleClaimAndProofTarget)>,
     custom_predicate_batches: Vec<CustomPredicateBatchTarget>,
     custom_predicate_verifications: Vec<CustomPredicateVerifyEntryTarget>,
 }
@@ -1421,7 +1437,7 @@ pub struct MainPodVerifyInput {
     pub recursive_pods_pub_self_statements: Vec<Vec<Statement>>,
     pub statements: Vec<mainpod::Statement>,
     pub operations: Vec<mainpod::Operation>,
-    pub merkle_proofs: Vec<MerkleClaimAndProof>,
+    pub merkle_proofs: Vec<(bool, MerkleClaimAndProof)>,
     pub custom_predicate_batches: Vec<Arc<CustomPredicateBatch>>,
     pub custom_predicate_verifications: Vec<CustomPredicateVerification>,
 }
@@ -1550,12 +1566,14 @@ impl InnerCircuit for MainPodVerifyTarget {
 
         assert!(input.merkle_proofs.len() <= self.params.max_merkle_proofs_containers);
         for (i, mp) in input.merkle_proofs.iter().enumerate() {
-            self.merkle_proofs[i].set_targets(pw, true, mp)?;
+            self.merkle_proofs[i].1.set_targets(pw, true, &mp.1)?;
+            pw.set_bool_target(self.merkle_proofs[i].0, mp.0)?;
         }
         // Padding
         let pad_mp = MerkleClaimAndProof::empty();
         for i in input.merkle_proofs.len()..self.params.max_merkle_proofs_containers {
-            self.merkle_proofs[i].set_targets(pw, false, &pad_mp)?;
+            self.merkle_proofs[i].1.set_targets(pw, false, &pad_mp)?;
+            pw.set_bool_target(self.merkle_proofs[i].0, false)?;
         }
 
         assert!(input.custom_predicate_batches.len() <= self.params.max_custom_predicate_batches);
@@ -1631,7 +1649,7 @@ mod tests {
         st: mainpod::Statement,
         op: mainpod::Operation,
         prev_statements: Vec<mainpod::Statement>,
-        merkle_proofs: Vec<MerkleClaimAndProof>,
+        merkle_proofs: Vec<(bool, MerkleClaimAndProof)>,
     ) -> Result<()> {
         let params = Params {
             max_custom_predicate_batches: 0,
@@ -1652,12 +1670,17 @@ mod tests {
             .collect();
         let merkle_proofs_target: Vec<_> = merkle_proofs
             .iter()
-            .map(|_| mp_gadget.eval(&mut builder))
+            .map(|_| {
+                (
+                    builder.add_virtual_bool_target_safe(),
+                    mp_gadget.eval(&mut builder),
+                )
+            })
             .collect();
         let merkle_claims_target: Vec<_> = merkle_proofs_target
             .clone()
             .into_iter()
-            .map(|pf| pf.into())
+            .map(|(ind, pf)| (ind, pf.into()))
             .collect();
         let custom_predicate_verification_table = vec![];
 
@@ -1680,9 +1703,10 @@ mod tests {
         for (prev_st_target, prev_st) in prev_statements_target.iter().zip(prev_statements.iter()) {
             prev_st_target.set_targets(&mut pw, &params, prev_st)?;
         }
-        for (merkle_proof_target, merkle_proof) in
+        for ((ind_target, merkle_proof_target), (ind, merkle_proof)) in
             merkle_proofs_target.iter().zip(merkle_proofs.iter())
         {
+            pw.set_bool_target(*ind_target, *ind)?;
             merkle_proof_target.set_targets(&mut pw, true, merkle_proof)?
         }
 
@@ -2452,11 +2476,9 @@ mod tests {
             OperationAux::MerkleProofIndex(0),
         );
 
-        let merkle_proofs = vec![MerkleClaimAndProof::new(
-            Hash::from(root.raw()),
-            key,
-            None,
-            no_key_pf,
+        let merkle_proofs = vec![(
+            false,
+            MerkleClaimAndProof::new(Hash::from(root.raw()), key, None, no_key_pf),
         )];
         let prev_statements = vec![root_st, key_st];
         operation_verify(st, op, prev_statements, merkle_proofs)
@@ -2499,11 +2521,9 @@ mod tests {
             OperationAux::MerkleProofIndex(0),
         );
 
-        let merkle_proofs = vec![MerkleClaimAndProof::new(
-            Hash::from(root.raw()),
-            key,
-            Some(value),
-            key_pf,
+        let merkle_proofs = vec![(
+            false,
+            MerkleClaimAndProof::new(Hash::from(root.raw()), key, Some(value), key_pf),
         )];
         let prev_statements = vec![root_st, key_st, value_st];
         operation_verify(st, op, prev_statements, merkle_proofs)
