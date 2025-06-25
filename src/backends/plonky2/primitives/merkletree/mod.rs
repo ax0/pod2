@@ -5,7 +5,7 @@ use std::{collections::HashMap, fmt, iter::IntoIterator};
 use plonky2::field::types::Field;
 use serde::{Deserialize, Serialize};
 
-use crate::middleware::{hash_fields, Hash, RawValue, EMPTY_HASH, EMPTY_VALUE, F};
+use crate::middleware::{hash_fields, hash_value, Hash, RawValue, EMPTY_HASH, EMPTY_VALUE, F};
 
 pub mod circuit;
 pub use circuit::*;
@@ -566,7 +566,7 @@ impl Leaf {
 // than the max_depth?
 /// returns the path of the given key
 pub(crate) fn keypath(max_depth: usize, k: RawValue) -> TreeResult<Vec<bool>> {
-    let bytes = k.to_bytes();
+    let bytes = RawValue::from(hash_value(&k)).to_bytes();
     if max_depth > 8 * bytes.len() {
         // note that our current keys are of Value type, which are 4 Goldilocks
         // field elements, ie ~256 bits, therefore the max_depth can not be
@@ -655,7 +655,12 @@ pub mod tests {
 
         let key = RawValue::from(1);
         let proof = tree.prove_nonexistence(&RawValue::from(1))?;
-        assert_eq!(proof.other_leaf, None);
+        // Clearly following the path down to 1 leads to 13.
+        assert_eq!(
+            proof.other_leaf,
+            Some((RawValue::from(13), RawValue::from(1013)))
+        );
+
         println!("{}", proof);
 
         MerkleTree::verify_nonexistence(32, tree.root(), &proof, &key)?;

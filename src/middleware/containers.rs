@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::serialization::{ordered_map, ordered_set};
 #[cfg(feature = "backend_plonky2")]
 use crate::backends::plonky2::primitives::merkletree::{MerkleProof, MerkleTree};
-use crate::middleware::{hash_value, Error, Hash, Key, RawValue, Result, Value};
+use crate::middleware::{Error, Hash, Key, RawValue, Result, Value};
 
 /// Dictionary: the user original keys and values are hashed to be used in the leaf.
 ///    leaf.key=hash(original_key)
@@ -130,8 +130,8 @@ impl Set {
         let kvs_raw: HashMap<RawValue, RawValue> = set
             .iter()
             .map(|e| {
-                let h = hash_value(&e.raw());
-                (RawValue::from(h), RawValue::from(h))
+                let v = e.raw();
+                (v, v)
             })
             .collect();
         Ok(Self {
@@ -147,23 +147,17 @@ impl Set {
         self.set.contains(value)
     }
     pub fn prove(&self, value: &Value) -> Result<MerkleProof> {
-        let h = hash_value(&value.raw());
-        let (_, proof) = self.mt.prove(&RawValue::from(h))?;
+        let v = value.raw();
+        let (_, proof) = self.mt.prove(&v)?;
         Ok(proof)
     }
     pub fn prove_nonexistence(&self, value: &Value) -> Result<MerkleProof> {
-        let h = hash_value(&value.raw());
-        Ok(self.mt.prove_nonexistence(&RawValue::from(h))?)
+        let v = value.raw();
+        Ok(self.mt.prove_nonexistence(&v)?)
     }
     pub fn verify(max_depth: usize, root: Hash, proof: &MerkleProof, value: &Value) -> Result<()> {
-        let h = hash_value(&value.raw());
-        Ok(MerkleTree::verify(
-            max_depth,
-            root,
-            proof,
-            &RawValue::from(h),
-            &RawValue::from(h),
-        )?)
+        let v = value.raw();
+        Ok(MerkleTree::verify(max_depth, root, proof, &v, &v)?)
     }
     pub fn verify_nonexistence(
         max_depth: usize,
@@ -171,13 +165,8 @@ impl Set {
         proof: &MerkleProof,
         value: &Value,
     ) -> Result<()> {
-        let h = hash_value(&value.raw());
-        Ok(MerkleTree::verify_nonexistence(
-            max_depth,
-            root,
-            proof,
-            &RawValue::from(h),
-        )?)
+        let v = value.raw();
+        Ok(MerkleTree::verify_nonexistence(max_depth, root, proof, &v)?)
     }
     pub fn set(&self) -> &HashSet<Value> {
         &self.set

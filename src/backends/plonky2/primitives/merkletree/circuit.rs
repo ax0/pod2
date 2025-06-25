@@ -367,6 +367,7 @@ fn keypath_target(
 ) -> Vec<BoolTarget> {
     let n_complete_field_elems: usize = max_depth / F::BITS;
     let n_extra_bits: usize = max_depth - n_complete_field_elems * F::BITS;
+    let key = builder.hash_n_to_hash_no_pad::<PoseidonHash>(key.elements.to_vec());
 
     let path: Vec<BoolTarget> = key
         .elements
@@ -626,7 +627,7 @@ pub mod tests {
         kvs.insert(RawValue::from(5), RawValue::from(1005));
         kvs.insert(RawValue::from(13), RawValue::from(1013));
 
-        let max_depth = 5;
+        let max_depth = 10;
         let tree = MerkleTree::new(max_depth, &kvs)?;
         // existence
         test_merkletree_edgecase_opt(max_depth, &tree, RawValue::from(5))?;
