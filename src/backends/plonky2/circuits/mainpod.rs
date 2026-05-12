@@ -3,7 +3,7 @@ use std::{array, iter};
 use itertools::{izip, zip_eq, Itertools};
 use num::{BigUint, One};
 use plonky2::{
-    field::types::Field,
+    field::{extension::quintic::QuinticExtension, types::Field},
     hash::{
         hash_types::HashOutTarget,
         poseidon::{PoseidonHash, PoseidonPermutation},
@@ -33,13 +33,14 @@ use crate::{
         },
         emptypod::EmptyPod,
         error::Result,
-        mainpod::{self, pad_statement, SignedBy},
+        mainpod::{self, pad_statement, EncryptionOf, SignedBy},
         primitives::{
             ec::{
                 bits::{BigUInt320Target, CircuitBuilderBits},
                 curve::{
                     CircuitBuilderElliptic, Point, PointTarget, WitnessWriteCurve, GROUP_ORDER,
                 },
+                field::{CircuitBuilderNNF, OEFTarget},
                 schnorr::{CircuitBuilderSchnorr, SecretKey, SignatureTarget, WitnessWriteSchnorr},
             },
             merkletree::{
@@ -55,7 +56,7 @@ use crate::{
     middleware::{
         CustomPredicate, CustomPredicateBatch, CustomPredicateRef, NativeOperation,
         NativePredicate, Params, PredicatePrefix, RawValue, Statement, StatementTmplArgPrefix,
-        ToFields, Value, F, HASH_SIZE,
+        ToFields, Value, CT_LEN, F, HASH_SIZE, PT_LEN,
     },
 };
 //
@@ -197,6 +198,7 @@ enum OperationAuxTableTag {
     SignedBy = 3,
     MerkleTreeStateTransitionProof = 4,
     CustomPredVerify = 5,
+    EncryptionOf = 6,
 }
 
 fn max_operation_aux_entry_len(params: &Params) -> usize {
@@ -204,6 +206,7 @@ fn max_operation_aux_entry_len(params: &Params) -> usize {
         (params.max_merkle_proofs_containers > 0).then(|| MerkleClaimTarget::size(params)),
         (params.max_public_key_of > 0).then(|| PubKeySecKeyTarget::size(params)),
         (params.max_signed_by > 0).then(|| MsgPubKeyTarget::size(params)),
+        (params.max_encryption_of > 0).then(|| PkPtCtTarget::size(params)),
         (params.max_merkle_tree_state_transition_proofs_containers > 0)
             .then(|| MerkleTreeStateTransitionClaimTarget::size(params)),
         (params.max_custom_predicate_verifications > 0)
@@ -236,6 +239,7 @@ impl Flattenable for HashPairTarget {
 
 type PubKeySecKeyTarget = HashPairTarget; // (public_key, secret_key)
 type MsgPubKeyTarget = HashPairTarget; // (message, public_key)
+type PkPtCtTarget = HashPairTarget; // ((pk, pt), ct)
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SignedByTarget {
@@ -261,6 +265,111 @@ impl SignedByTarget {
     }
 }
 
+pub type PlaintextTarget = Vec<Target>;
+pub type CiphertextTarget = Vec<Target>;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct EncryptionOfTarget {
+    pk: PointTarget,
+    pt: PlaintextTarget,
+    ct: CiphertextTarget,
+    sender_sk: BigUInt320Target,
+}
+
+// TODO: Remove when `verify` below is cleaned up.
+type FqT = OEFTarget<5, QuinticExtension<F>>;
+fn hash_state_target(builder: &mut CircuitBuilder, s: [FqT; 4]) -> [FqT; 4] {
+    let elems: [Target; 4 * 5] = array::from_fn(|i| s[i / 5].components[i % 5]);
+    let h = builder.hash_n_to_m_no_pad::<PoseidonHash>(elems.to_vec(), 4 * 5);
+    array::from_fn(|i| FqT::new(array::from_fn::<_, 5, _>(|j| h[j + 5 * i])))
+}
+
+impl EncryptionOfTarget {
+    pub fn set_targets(
+        &self,
+        pw: &mut PartialWitness<F>,
+        encryption_of: &EncryptionOf,
+    ) -> Result<()> {
+        pw.set_point_target(&self.pk, &encryption_of.pk)?;
+        pw.set_target_arr(&self.pt, &encryption_of.pt)?;
+        pw.set_target_arr(&self.ct, &encryption_of.ct)?;
+        pw.set_biguint320_target(&self.sender_sk, &encryption_of.sender_sk.0)?;
+        Ok(())
+    }
+
+    pub fn new_virtual(builder: &mut CircuitBuilder) -> Self {
+        Self {
+            pk: builder.add_virtual_point_target(),
+            pt: builder.add_virtual_targets(PT_LEN),
+            ct: builder.add_virtual_targets(CT_LEN),
+            sender_sk: builder.add_virtual_biguint320_target(),
+        }
+    }
+
+    pub fn verify(&self, builder: &mut CircuitBuilder) {
+        // TODO: Use `PoseidonEncryptTarget` rather than
+        // inlining. This would require exposing the fields of the
+        // struct or adding extra methods to connect them to other
+        // targets.
+        const L: usize = PT_LEN / 5;
+        let zero = builder.zero();
+        let fqt_zero = FqT::new([zero, zero, zero, zero, zero]);
+
+        // add targets
+        let ks = builder.multiply_point(&self.sender_sk.bits, &self.pk);
+        let m: [FqT; L] = array::from_fn(|_| builder.add_virtual_nnf_target());
+        let nonce: [Target; 2] = array::from_fn(|i| self.ct[i]);
+        let invgenerator = builder.constant_point(Point::generator().inverse());
+        let sender_pk_vec = {
+            let pk = builder.multiply_point(&self.sender_sk.bits, &invgenerator);
+            pk.x.components
+                .into_iter()
+                .chain(pk.u.components)
+                .collect::<Vec<_>>()
+        };
+        let mut expected_ct: [FqT; L + 1] = array::from_fn(|_| fqt_zero.clone());
+
+        // build the circuit logic
+        let f_zero = builder.constant(F::ZERO);
+        let n_l = FqT::new([
+            nonce[0],
+            nonce[1],
+            builder.constant(F::from_canonical_u64(L as u64)),
+            f_zero,
+            f_zero,
+        ]);
+        let fq_zero: FqT = FqT::new([f_zero, f_zero, f_zero, f_zero, f_zero]);
+        let mut s: [FqT; 4] = [fq_zero, ks.x.clone(), ks.u.clone(), n_l];
+
+        for i in 0..L / 3 {
+            s = hash_state_target(builder, s);
+
+            // absorb
+            s[1] = builder.nnf_add(&s[1], &m[i * 3]);
+            s[2] = builder.nnf_add(&s[2], &m[i * 3 + 1]);
+            s[3] = builder.nnf_add(&s[3], &m[i * 3 + 2]);
+
+            // release
+            expected_ct[i * 3] = s[1].clone();
+            expected_ct[i * 3 + 1] = s[2].clone();
+            expected_ct[i * 3 + 2] = s[3].clone();
+        }
+        s = hash_state_target(builder, s);
+        expected_ct[L] = s[1].clone();
+
+        // Connect CT & PT targets
+        let expected_ct_fields: Vec<_> = expected_ct
+            .iter()
+            .flat_map(|ext_x| ext_x.components)
+            .collect();
+        let m_fields: Vec<_> = m.iter().flat_map(|ext_x| ext_x.components).collect();
+
+        builder.connect_slice(&self.pt, &m_fields);
+        builder.connect_slice(&self.ct[12..], &expected_ct_fields);
+        builder.connect_slice(&self.ct[2..12], &sender_pk_vec);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_operation_aux_table_circuit(
     params: &Params,
@@ -268,6 +377,7 @@ fn build_operation_aux_table_circuit(
     merkle_proofs: &[MerkleClaimAndProofTarget],
     public_key_of_sks: &[BigUInt320Target],
     signed_bys: &[SignedByTarget],
+    encryption_ofs: &[EncryptionOfTarget],
     merkle_tree_state_transition_proofs: &[MerkleTreeStateTransitionProofTarget],
     custom_predicate_verifications: &[CustomPredicateVerifyEntryTarget],
     custom_predicate_table: &[HashOutTarget],
@@ -343,6 +453,33 @@ fn build_operation_aux_table_circuit(
         let entry: MsgPubKeyTarget = HashPairTarget(HashOutTarget::from(signed_by.msg), pk_hash);
 
         table.push(builder, OperationAuxTableTag::SignedBy as u32, &entry);
+        measure_gates_end!(builder, measure);
+    }
+
+    // EncryptionOf: verify the Schnorr signature of a message with a public key
+    for encryption_of in encryption_ofs {
+        let measure = measure_gates_begin!(builder, "EncryptionOf");
+
+        encryption_of.verify(builder);
+
+        let pk_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(
+            encryption_of
+                .pk
+                .x
+                .components
+                .into_iter()
+                .chain(encryption_of.pk.u.components)
+                .collect(),
+        );
+
+        let pt_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(encryption_of.pt.clone());
+
+        let pk_pt_hash = builder
+            .hash_n_to_hash_no_pad::<PoseidonHash>([pk_hash.elements, pt_hash.elements].concat());
+        let ct_hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(encryption_of.ct.clone());
+        let entry: PkPtCtTarget = HashPairTarget(pk_pt_hash, ct_hash);
+
+        table.push(builder, OperationAuxTableTag::EncryptionOf as u32, &entry);
         measure_gates_end!(builder, measure);
     }
 
@@ -478,6 +615,16 @@ fn verify_operation_circuit(
         }
         if params.max_signed_by > 0 {
             op_checks.push(verify_signed_by_circuit(
+                params,
+                builder,
+                st,
+                &op.op_type,
+                &resolved_aux,
+                &cache,
+            ));
+        }
+        if params.max_encryption_of > 0 {
+            op_checks.push(verify_encryption_of_circuit(
                 params,
                 builder,
                 st,
@@ -1095,6 +1242,43 @@ fn verify_signed_by_circuit(
     let st_ok = builder.is_equal_flattenable(st, &expected_statement);
 
     let ok = builder.all([op_code_ok, aux_tag_ok, arg_types_ok, msg_ok, pk_ok, st_ok]);
+    measure_gates_end!(builder, measure);
+    ok
+}
+
+fn verify_encryption_of_circuit(
+    params: &Params,
+    builder: &mut CircuitBuilder,
+    st: &StatementTarget,
+    op_type: &OperationTypeTarget,
+    aux: &TableEntryTarget,
+    cache: &StatementCache,
+) -> BoolTarget {
+    let measure = measure_gates_begin!(builder, "OpEncryptionOf");
+    let (aux_tag_ok, resolved_pk_pt_ct) =
+        aux.as_type::<PkPtCtTarget>(builder, OperationAuxTableTag::EncryptionOf as u32);
+
+    let op_code_ok = op_type.has_native(builder, NativeOperation::EncryptionOf);
+    let (arg_types_ok, [pk, ct, pt]) = cache.first_n_args_as_values();
+
+    let pk_pt_hash =
+        builder.hash_n_to_hash_no_pad::<PoseidonHash>([pk.elements, pt.elements].concat());
+
+    let pk_pt_ok = builder.is_equal_slice(&pk_pt_hash.elements, &resolved_pk_pt_ct.0.elements);
+    let ct_ok = builder.is_equal_slice(&ct.elements, &resolved_pk_pt_ct.1.elements);
+
+    let arg1_expected = cache.equations[0].lhs.clone();
+    let arg2_expected = cache.equations[1].lhs.clone();
+    let arg3_expected = cache.equations[2].lhs.clone();
+    let expected_statement = StatementTarget::new_native(
+        builder,
+        params,
+        NativePredicate::EncryptionOf,
+        &[arg1_expected, arg2_expected, arg3_expected],
+    );
+    let st_ok = builder.is_equal_flattenable(st, &expected_statement);
+
+    let ok = builder.all([op_code_ok, aux_tag_ok, arg_types_ok, pk_pt_ok, ct_ok, st_ok]);
     measure_gates_end!(builder, measure);
     ok
 }
@@ -1750,6 +1934,7 @@ fn verify_main_pod_circuit(
         &main_pod.merkle_proofs,
         &main_pod.public_key_of_sks,
         &main_pod.signed_bys,
+        &main_pod.encryption_ofs,
         &main_pod.merkle_tree_state_transition_proofs,
         &main_pod.custom_predicate_verifications,
         &custom_predicate_table,
@@ -1784,6 +1969,7 @@ pub struct MainPodVerifyTarget {
     merkle_proofs: Vec<MerkleClaimAndProofTarget>,
     public_key_of_sks: Vec<BigUInt320Target>,
     signed_bys: Vec<SignedByTarget>,
+    encryption_ofs: Vec<EncryptionOfTarget>,
     merkle_tree_state_transition_proofs: Vec<MerkleTreeStateTransitionProofTarget>,
     custom_predicates: Vec<CustomPredicateInBatchTarget>,
     custom_predicate_verifications: Vec<CustomPredicateVerifyEntryTarget>,
@@ -1820,6 +2006,9 @@ impl MainPodVerifyTarget {
                 .collect(),
             signed_bys: (0..params.max_signed_by)
                 .map(|_| SignedByTarget::new_virtual(builder))
+                .collect(),
+            encryption_ofs: (0..params.max_encryption_of)
+                .map(|_| EncryptionOfTarget::new_virtual(builder))
                 .collect(),
             merkle_tree_state_transition_proofs: (0..params
                 .max_merkle_tree_state_transition_proofs_containers)
@@ -1860,6 +2049,7 @@ pub struct MainPodVerifyInput {
     pub merkle_proofs: Vec<MerkleClaimAndProof>,
     pub public_key_of_sks: Vec<SecretKey>,
     pub signed_bys: Vec<SignedBy>,
+    pub encryption_ofs: Vec<EncryptionOf>,
     pub merkle_tree_state_transition_proofs: Vec<MerkleTreeStateTransitionProof>,
     pub custom_predicates_with_mpt_proofs: Vec<(CustomPredicateRef, MerkleProof)>,
     pub custom_predicate_verifications: Vec<CustomPredicateVerification>,
@@ -1984,6 +2174,16 @@ impl InnerCircuit for MainPodVerifyTarget {
             self.signed_bys[i].set_targets(pw, &pad_signed_by)?;
         }
 
+        assert!(input.encryption_ofs.len() <= self.params.max_encryption_of);
+        for (i, encryption_of) in input.encryption_ofs.iter().enumerate() {
+            self.encryption_ofs[i].set_targets(pw, encryption_of)?;
+        }
+        // Padding
+        let pad_encryption_of = EncryptionOf::dummy();
+        for i in input.encryption_ofs.len()..self.params.max_encryption_of {
+            self.encryption_ofs[i].set_targets(pw, &pad_encryption_of)?;
+        }
+
         assert!(
             input.merkle_tree_state_transition_proofs.len()
                 <= self
@@ -2075,8 +2275,9 @@ mod tests {
         dict,
         frontend::{self, literal, CustomPredicateBatchBuilder, StatementTmplBuilder},
         middleware::{
-            hash_values, AnchoredKey, Hash, Key, OperationType, Predicate, PredicateOrWildcard,
-            RawValue, StatementArg, StatementTmpl, StatementTmplArg, Wildcard, EMPTY_VALUE,
+            encrypt_fields, hash_values, AnchoredKey, Hash, Key, OperationType, Predicate,
+            PredicateOrWildcard, RawValue, StatementArg, StatementTmpl, StatementTmplArg,
+            TypedValue, Wildcard, EMPTY_VALUE,
         },
     };
 
@@ -2085,6 +2286,7 @@ mod tests {
         merkle_proofs: Vec<MerkleClaimAndProof>,
         secret_keys: Vec<SecretKey>,
         signed_bys: Vec<SignedBy>,
+        encryption_ofs: Vec<EncryptionOf>,
         merkle_tree_state_transition_proofs: Vec<MerkleTreeStateTransitionProof>,
     }
 
@@ -2107,6 +2309,12 @@ mod tests {
                 ..Default::default()
             }
         }
+        fn encryption_of(v: EncryptionOf) -> Self {
+            Self {
+                encryption_ofs: vec![v],
+                ..Default::default()
+            }
+        }
         fn merkle_tree_state_transition_proof(v: MerkleTreeStateTransitionProof) -> Self {
             Self {
                 merkle_tree_state_transition_proofs: vec![v],
@@ -2125,6 +2333,7 @@ mod tests {
             max_merkle_proofs_containers: aux.merkle_proofs.len(),
             max_public_key_of: aux.secret_keys.len(),
             max_signed_by: aux.signed_bys.len(),
+            max_encryption_of: aux.encryption_ofs.len(),
             max_merkle_tree_state_transition_proofs_containers: aux
                 .merkle_tree_state_transition_proofs
                 .len(),
@@ -2162,6 +2371,12 @@ mod tests {
             .map(|_| SignedByTarget::new_virtual(&mut builder))
             .collect();
 
+        let encryption_of_targets: Vec<_> = aux
+            .encryption_ofs
+            .iter()
+            .map(|_| EncryptionOfTarget::new_virtual(&mut builder))
+            .collect();
+
         let merkle_tree_state_transition_proofs_target: Vec<_> = aux
             .merkle_tree_state_transition_proofs
             .iter()
@@ -2179,6 +2394,7 @@ mod tests {
             &merkle_proofs_target,
             &secret_keys_target,
             &signed_by_targets,
+            &encryption_of_targets,
             &merkle_tree_state_transition_proofs_target,
             &[],
             &[],
@@ -2201,6 +2417,11 @@ mod tests {
         }
         for (signed_by_target, signed_by) in signed_by_targets.iter().zip(aux.signed_bys.iter()) {
             signed_by_target.set_targets(&mut pw, signed_by)?
+        }
+        for (encryption_of_target, encryption_of) in
+            encryption_of_targets.iter().zip(aux.encryption_ofs.iter())
+        {
+            encryption_of_target.set_targets(&mut pw, encryption_of)?
         }
         for (merkle_proof_target, merkle_proof) in
             merkle_proofs_target.iter().zip(aux.merkle_proofs.iter())
@@ -3066,6 +3287,41 @@ mod tests {
         );
         let prev_statements = vec![Statement::None.into()];
         operation_verify(st, op, prev_statements, Aux::signed_by(signed_by))
+    }
+
+    #[test]
+    fn test_operation_verify_encryptionof_ok() -> Result<()> {
+        let sender_sk = SecretKey(BigUint::from_u32(0x1337).unwrap());
+        let sk = SecretKey(BigUint::from_u32(0xbadcafe).unwrap());
+        let pk = sk.public_key();
+        let pt_vec = (0..)
+            .map(|i| F::from_canonical_u64(i))
+            .take(PT_LEN)
+            .collect::<Vec<_>>();
+        let pt = Value::from(TypedValue::Plaintext(pt_vec.clone()));
+        let nonce = [F(42), F(42)];
+        let ct_vec = encrypt_fields(nonce, &sender_sk, pk, pt_vec.clone())?;
+        let ct = Value::from(TypedValue::Ciphertext(ct_vec.clone()));
+
+        let encryption_of = EncryptionOf {
+            pk,
+            pt: pt_vec,
+            ct: ct_vec,
+            sender_sk,
+        };
+
+        let st: mainpod::Statement = Statement::encryption_of(pk, ct, pt).into();
+        let op = mainpod::Operation(
+            OperationType::Native(NativeOperation::EncryptionOf),
+            vec![
+                OperationArg::Index(0),
+                OperationArg::Index(0),
+                OperationArg::Index(0),
+            ],
+            OperationAux::EncryptionOfIndex(0),
+        );
+        let prev_statements = vec![Statement::None.into()];
+        operation_verify(st, op, prev_statements, Aux::encryption_of(encryption_of))
     }
 
     fn helper_statement_arg_from_template(

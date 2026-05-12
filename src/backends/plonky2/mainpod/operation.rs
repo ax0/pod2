@@ -36,6 +36,7 @@ pub enum OperationAux {
     MerkleProofIndex(usize),
     PublicKeyOfIndex(usize),
     SignedByIndex(usize),
+    EncryptionOfIndex(usize),
     MerkleTreeStateTransitionProofIndex(usize),
     CustomPredVerifyIndex(usize),
 }
@@ -51,8 +52,11 @@ impl OperationAux {
     fn table_offset_signed_by(params: &Params) -> usize {
         Self::table_offset_public_key_of(params) + params.max_public_key_of
     }
-    fn table_offset_merkle_tree_state_transition_proof(params: &Params) -> usize {
+    fn table_offset_encryption_of(params: &Params) -> usize {
         Self::table_offset_signed_by(params) + params.max_signed_by
+    }
+    fn table_offset_merkle_tree_state_transition_proof(params: &Params) -> usize {
+        Self::table_offset_encryption_of(params) + params.max_encryption_of
     }
     fn table_offset_custom_pred_verify(params: &Params) -> usize {
         Self::table_offset_merkle_tree_state_transition_proof(params)
@@ -62,6 +66,7 @@ impl OperationAux {
         1 + params.max_merkle_proofs_containers
             + params.max_public_key_of
             + params.max_signed_by
+            + params.max_encryption_of
             + params.max_merkle_tree_state_transition_proofs_containers
             + params.max_custom_predicate_verifications
     }
@@ -71,6 +76,7 @@ impl OperationAux {
             Self::MerkleProofIndex(i) => Self::table_offset_merkle_proof(params) + *i,
             Self::PublicKeyOfIndex(i) => Self::table_offset_public_key_of(params) + *i,
             Self::SignedByIndex(i) => Self::table_offset_signed_by(params) + *i,
+            Self::EncryptionOfIndex(i) => Self::table_offset_encryption_of(params) + *i,
             Self::MerkleTreeStateTransitionProofIndex(i) => {
                 Self::table_offset_merkle_tree_state_transition_proof(params) + *i
             }
@@ -139,7 +145,7 @@ impl Operation {
                     .sig
                     .clone(),
             ),
-            OperationAux::PublicKeyOfIndex(_) => crate::middleware::OperationAux::None,
+            _ => crate::middleware::OperationAux::None,
         };
         Ok(middleware::Operation::op(
             self.0.clone(),
@@ -169,6 +175,7 @@ impl fmt::Display for Operation {
             OperationAux::CustomPredVerifyIndex(i) => write!(f, " custom_pred_verify_{:02}", i)?,
             OperationAux::PublicKeyOfIndex(i) => write!(f, " public_key_of_{:02}", i)?,
             OperationAux::SignedByIndex(i) => write!(f, " signed_by_{:02}", i)?,
+            OperationAux::EncryptionOfIndex(i) => write!(f, " encryption_of_{:02}", i)?,
             OperationAux::MerkleTreeStateTransitionProofIndex(i) => {
                 write!(f, " merkle_tree_state_transition_proof_{:02}", i)?
             }

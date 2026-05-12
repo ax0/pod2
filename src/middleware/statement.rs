@@ -35,6 +35,7 @@ pub enum NativePredicate {
     ContainerInsert = 14,
     ContainerUpdate = 15,
     ContainerDelete = 16,
+    EncryptionOf = 17,
 
     // Syntactic sugar predicates.  These predicates are not supported by the backend.  The
     // frontend compiler is responsible of translating these predicates into the predicates above.
@@ -79,7 +80,8 @@ impl NativePredicate {
             | NativePredicate::SetInsert
             | NativePredicate::SetDelete
             | NativePredicate::DictDelete
-            | NativePredicate::ContainerDelete => 3,
+            | NativePredicate::ContainerDelete
+            | NativePredicate::EncryptionOf => 3,
             NativePredicate::DictInsert
             | NativePredicate::DictUpdate
             | NativePredicate::ArrayUpdate
@@ -108,6 +110,7 @@ impl Display for NativePredicate {
             NativePredicate::HashOf => "HashOf",
             NativePredicate::PublicKeyOf => "PublicKeyOf",
             NativePredicate::SignedBy => "SignedBy",
+            NativePredicate::EncryptionOf => "EncryptionOf",
             NativePredicate::ContainerInsert => "ContainerInsert",
             NativePredicate::ContainerUpdate => "ContainerUpdate",
             NativePredicate::ContainerDelete => "ContainerDelete",
@@ -151,6 +154,7 @@ impl FromStr for NativePredicate {
             "HashOf" => Ok(NativePredicate::HashOf),
             "PublicKeyOf" => Ok(NativePredicate::PublicKeyOf),
             "SignedBy" => Ok(NativePredicate::SignedBy),
+            "EncryptionOf" => Ok(NativePredicate::EncryptionOf),
             "ContainerInsert" => Ok(NativePredicate::ContainerInsert),
             "ContainerUpdate" => Ok(NativePredicate::ContainerUpdate),
             "ContainerDelete" => Ok(NativePredicate::ContainerDelete),
@@ -294,6 +298,7 @@ pub enum Statement {
     HashOf(ValueRef, ValueRef, ValueRef),
     PublicKeyOf(ValueRef, ValueRef),
     SignedBy(ValueRef, ValueRef),
+    EncryptionOf(ValueRef, ValueRef, ValueRef),
     ContainerInsert(
         /* new_root */ ValueRef,
         /* old_root */ ValueRef,
@@ -358,6 +363,7 @@ impl Statement {
     statement_constructor!(hash_of, HashOf, 3);
     statement_constructor!(public_key_of, PublicKeyOf, 2);
     statement_constructor!(signed_by, SignedBy, 2);
+    statement_constructor!(encryption_of, EncryptionOf, 3);
     statement_constructor!(insert, ContainerInsert, 4);
     statement_constructor!(update, ContainerUpdate, 4);
     statement_constructor!(delete, ContainerDelete, 3);
@@ -377,6 +383,7 @@ impl Statement {
             Self::HashOf(_, _, _) => Native(NativePredicate::HashOf),
             Self::PublicKeyOf(_, _) => Native(NativePredicate::PublicKeyOf),
             Self::SignedBy(_, _) => Native(NativePredicate::SignedBy),
+            Self::EncryptionOf(_, _, _) => Native(NativePredicate::EncryptionOf),
             Self::ContainerInsert(_, _, _, _) => Native(NativePredicate::ContainerInsert),
             Self::ContainerUpdate(_, _, _, _) => Native(NativePredicate::ContainerUpdate),
             Self::ContainerDelete(_, _, _) => Native(NativePredicate::ContainerDelete),
@@ -400,6 +407,7 @@ impl Statement {
             Self::HashOf(ak1, ak2, ak3) => vec![ak1.into(), ak2.into(), ak3.into()],
             Self::PublicKeyOf(ak1, ak2) => vec![ak1.into(), ak2.into()],
             Self::SignedBy(ak1, ak2) => vec![ak1.into(), ak2.into()],
+            Self::EncryptionOf(ak1, ak2, ak3) => vec![ak1.into(), ak2.into(), ak3.into()],
             Self::ContainerInsert(ak1, ak2, ak3, ak4) => {
                 vec![ak1.into(), ak2.into(), ak3.into(), ak4.into()]
             }
@@ -457,6 +465,9 @@ impl Statement {
             }
             (Native(NativePredicate::SignedBy), &[a1, a2]) => {
                 Self::SignedBy(a1.try_into()?, a2.try_into()?)
+            }
+            (Native(NativePredicate::EncryptionOf), &[a1, a2, a3]) => {
+                Self::EncryptionOf(a1.try_into()?, a2.try_into()?, a3.try_into()?)
             }
             (Native(NativePredicate::ContainerInsert), &[a1, a2, a3, a4]) => Self::ContainerInsert(
                 a1.try_into()?,

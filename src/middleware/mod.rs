@@ -2,6 +2,7 @@
 //! the backend.
 
 use hex::ToHex;
+use plonky2::field::extension::{quintic::QuinticExtension, FieldExtension};
 use strum_macros::FromRepr;
 
 mod basetypes;
@@ -28,6 +29,14 @@ pub use operation::*;
 pub use pod_deserialization::*;
 use serialization::*;
 pub use statement::*;
+
+// TODO
+pub const PT_LEN: usize = 3 * 5 * 69;
+pub const CT_LEN: usize = PT_LEN + 2 + 10 + 5;
+// Should be of length `PT_LEN`.
+pub type Plaintext = Vec<F>;
+// Should be of length `CT_LEN`. Includes nonce, sender public key & integrity check.
+pub type Ciphertext = Vec<F>;
 
 // TODO: Move all value-related types to to `value.rs`
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -56,6 +65,10 @@ pub(crate) enum TypedValue {
     PublicKey(PublicKey),
     // Schnorr secret key variant (scalar)
     SecretKey(SecretKey),
+    // Poseidon cipher plaintext
+    Plaintext(Plaintext),
+    // Poseidon cipher ciphertext
+    Ciphertext(Ciphertext),
     // Predicate as a value
     Predicate(Predicate),
     // UNTAGGED TYPES:
@@ -209,6 +222,34 @@ impl fmt::Display for TypedValue {
             }
             TypedValue::PublicKey(p) => write!(f, "PublicKey({})", p),
             TypedValue::SecretKey(p) => write!(f, "SecretKey({})", p),
+            TypedValue::Plaintext(pt) => {
+                write!(f, "[")?;
+                for (i, v) in pt.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if i == 8 {
+                        write!(f, "…")?;
+                        break;
+                    }
+                    write!(f, "{}", v)?
+                }
+                write!(f, "]")
+            }
+            TypedValue::Ciphertext(ct) => {
+                write!(f, "[")?;
+                for (i, v) in ct.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    if i == 8 {
+                        write!(f, "…")?;
+                        break;
+                    }
+                    write!(f, "{}", v)?
+                }
+                write!(f, "]")
+            }
             TypedValue::Predicate(p) => write!(f, "Predicate({})", p),
             TypedValue::Raw(r) => {
                 write!(f, "Raw(0x{})", r.encode_hex::<String>())
@@ -228,6 +269,8 @@ impl From<&TypedValue> for RawValue {
             TypedValue::Raw(v) => *v,
             TypedValue::PublicKey(p) => RawValue::from(hash_fields(&p.as_fields())),
             TypedValue::SecretKey(sk) => RawValue::from(hash_fields(&sk.to_limbs())),
+            TypedValue::Plaintext(pt) => RawValue::from(hash_fields(pt)),
+            TypedValue::Ciphertext(ct) => RawValue::from(hash_fields(ct)),
             TypedValue::Predicate(p) => RawValue::from(p.hash()),
         }
     }
@@ -320,6 +363,8 @@ impl JsonSchema for TypedValue {
             ..Default::default()
         };
 
+        // TODO: Plaintext & ciphertext
+
         // This is the part that Schemars can't generate automatically:
         let untagged_array_schema = gen.subschema_for::<Array>();
         let untagged_set_schema = gen.subschema_for::<Set>();
@@ -398,6 +443,8 @@ enum TypedValueNoRec {
     Int(i64),
     PublicKey(PublicKey),
     SecretKey(SecretKey),
+    Plaintext(Plaintext),
+    Ciphertext(Ciphertext),
     Predicate(Predicate),
     Set(Hash),
     Dictionary(Hash),
@@ -414,6 +461,8 @@ impl Value {
             TypedValue::Raw(v) => TypedValueNoRec::Raw(*v),
             TypedValue::PublicKey(v) => TypedValueNoRec::PublicKey(*v),
             TypedValue::SecretKey(v) => TypedValueNoRec::SecretKey(v.clone()),
+            TypedValue::Plaintext(v) => TypedValueNoRec::Plaintext(v.clone()),
+            TypedValue::Ciphertext(v) => TypedValueNoRec::Ciphertext(v.clone()),
             TypedValue::Predicate(v) => TypedValueNoRec::Predicate(v.clone()),
             TypedValue::Set(v) => TypedValueNoRec::Set(v.commitment()),
             TypedValue::Dictionary(v) => TypedValueNoRec::Dictionary(v.commitment()),
@@ -429,6 +478,8 @@ impl Value {
             TypedValueNoRec::Raw(v) => Value::from(v),
             TypedValueNoRec::PublicKey(v) => Value::from(v),
             TypedValueNoRec::SecretKey(v) => Value::from(v),
+            TypedValueNoRec::Plaintext(v) => Value::from(TypedValue::Plaintext(v)),
+            TypedValueNoRec::Ciphertext(v) => Value::from(TypedValue::Ciphertext(v)),
             TypedValueNoRec::Predicate(v) => Value::from(v),
             TypedValueNoRec::Set(v) => Value::from(Set::from_db(v, db)?),
             TypedValueNoRec::Dictionary(v) => Value::from(Dictionary::from_db(v, db)?),
@@ -493,6 +544,18 @@ impl Value {
     pub fn as_secret_key(&self) -> Option<SecretKey> {
         match &self.typed {
             TypedValue::SecretKey(sk) => Some(sk.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_plaintext(&self) -> Option<Plaintext> {
+        match &self.typed {
+            TypedValue::Plaintext(pt) => Some(pt.clone()),
+            _ => None,
+        }
+    }
+    pub fn as_ciphertext(&self) -> Option<Ciphertext> {
+        match &self.typed {
+            TypedValue::Ciphertext(ct) => Some(ct.clone()),
             _ => None,
         }
     }
@@ -806,6 +869,8 @@ pub struct Params {
     pub max_public_key_of: usize,
     // maximum number of signature verifications used for SignedBy operation
     pub max_signed_by: usize,
+    // Maximum number of encryptions used for EncryptionOf operation
+    pub max_encryption_of: usize,
 }
 
 impl Default for Params {
@@ -825,6 +890,7 @@ impl Default for Params {
             max_depth_mt_vds: 6, // up to 64 (2^6) different pod circuits
             max_public_key_of: 2,
             max_signed_by: 4,
+            max_encryption_of: 1,
         }
     }
 }
@@ -1027,4 +1093,48 @@ pub trait MainPodProver {
 pub trait ToFields {
     /// returns `Vec<F>` representation of the type
     fn to_fields(&self) -> Vec<F>;
+}
+
+// Encryption routine using `poseidon-cipher`.
+pub fn encrypt_fields(
+    nonce: [F; 2],
+    sender_sk: &SecretKey,
+    pk: PublicKey,
+    pt: Plaintext,
+) -> Result<Ciphertext> {
+    use plonky2_poseidon_cipher::encrypt;
+    assert!(pt.len() == PT_LEN);
+    assert!(nonce.len() == 2);
+
+    let sender_pk = sender_sk.public_key().as_fields();
+
+    // Shared secret
+    let ss = &sender_sk.0 * pk;
+    let ss = serde_json::to_string_pretty(&ss)?;
+    let pt = pt
+        .chunks(5)
+        .map(|chunk| {
+            let chunk_arr: [_; 5] = chunk.try_into().map_err(|_| {
+                Error::custom("Invalid plaintext has length not proportional to 5.".to_string())
+            })?;
+            Ok(QuinticExtension::from_basefield_array(chunk_arr))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let ct = encrypt(serde_json::from_str(&ss)?, &pt, nonce)
+        .into_iter()
+        .flat_map(|ef| <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&ef))
+        .collect::<Vec<_>>();
+
+    Ok((0..CT_LEN)
+        .map(|i| {
+            if i < 2 {
+                nonce[i]
+            } else if i < 12 {
+                sender_pk[i - 2]
+            } else {
+                ct[i - 12]
+            }
+        })
+        .collect())
 }

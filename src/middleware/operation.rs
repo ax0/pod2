@@ -11,10 +11,10 @@ use crate::{
         merkletree::{MerkleProof, MerkleTree, MerkleTreeOp, MerkleTreeStateTransitionProof},
     },
     middleware::{
-        hash_values, AnchoredKey, CustomPredicate, CustomPredicateRef, Error, Hash, Key,
-        MiddlewareInnerError, NativePredicate, Params, Predicate, PredicateOrWildcard, Result,
-        Statement, StatementArg, StatementTmpl, StatementTmplArg, ToFields, Value, ValueRef,
-        Wildcard, F,
+        encrypt_fields, hash_values, AnchoredKey, CustomPredicate, CustomPredicateRef, Error, Hash,
+        Key, MiddlewareInnerError, NativePredicate, Params, Predicate, PredicateOrWildcard, Result,
+        SecretKey, Statement, StatementArg, StatementTmpl, StatementTmplArg, ToFields, Value,
+        ValueRef, Wildcard, F,
     },
 };
 
@@ -30,6 +30,7 @@ pub enum OperationAux {
     MerkleProof(MerkleProof),
     MerkleTreeStateTransitionProof(MerkleTreeStateTransitionProof),
     Signature(Signature),
+    SecretKey(SecretKey),
 }
 
 impl fmt::Display for OperationAux {
@@ -42,6 +43,7 @@ impl fmt::Display for OperationAux {
                 write!(f, "merkle_tree_state_transition_proof({:?})", pf)?
             }
             Self::Signature(sig) => write!(f, "signature({:?})", sig)?,
+            Self::SecretKey(sk) => write!(f, "secret_key({:?})", sk)?,
         }
         Ok(())
     }
@@ -89,6 +91,7 @@ pub enum NativeOperation {
     ContainerInsertFromEntries = 16,
     ContainerUpdateFromEntries = 17,
     ContainerDeleteFromEntries = 18,
+    EncryptionOf = 19,
 
     // Syntactic sugar operations.  These operations are not supported by the backend.  The
     // frontend compiler is responsible of translating these operations into the operations above.
@@ -155,6 +158,9 @@ impl OperationType {
                     Some(Predicate::Native(NativePredicate::PublicKeyOf))
                 }
                 NativeOperation::SignedBy => Some(Predicate::Native(NativePredicate::SignedBy)),
+                NativeOperation::EncryptionOf => {
+                    Some(Predicate::Native(NativePredicate::EncryptionOf))
+                }
                 NativeOperation::ContainerInsertFromEntries => {
                     Some(Predicate::Native(NativePredicate::ContainerInsert))
                 }
@@ -199,6 +205,7 @@ pub enum Operation {
     HashOf(Statement, Statement, Statement),
     PublicKeyOf(Statement, Statement),
     SignedBy(Statement, Statement, Signature),
+    EncryptionOf(Statement, Statement, Statement, SecretKey),
     ContainerInsertFromEntries(
         /* new_root */ Statement,
         /* old_root */ Statement,
@@ -263,6 +270,7 @@ impl Operation {
             Self::HashOf(_, _, _) => OT::Native(HashOf),
             Self::PublicKeyOf(_, _) => OT::Native(PublicKeyOf),
             Self::SignedBy(_, _, _) => OT::Native(SignedBy),
+            Self::EncryptionOf(_, _, _, _) => OT::Native(EncryptionOf),
             Self::ContainerInsertFromEntries(_, _, _, _, _) => {
                 OT::Native(ContainerInsertFromEntries)
             }
@@ -292,6 +300,7 @@ impl Operation {
             Self::HashOf(s1, s2, s3) => vec![s1, s2, s3],
             Self::PublicKeyOf(s1, s2) => vec![s1, s2],
             Self::SignedBy(s1, s2, _sig) => vec![s1, s2],
+            Self::EncryptionOf(s1, s2, s3, _sk) => vec![s1, s2, s3],
             Self::ContainerInsertFromEntries(s1, s2, s3, s4, _pf) => vec![s1, s2, s3, s4],
             Self::ContainerUpdateFromEntries(s1, s2, s3, s4, _pf) => vec![s1, s2, s3, s4],
             Self::ContainerDeleteFromEntries(s1, s2, s3, _pf) => vec![s1, s2, s3],
@@ -349,6 +358,9 @@ impl Operation {
                 (NO::PublicKeyOf, &[s1, s2], OA::None) => Self::PublicKeyOf(s1.clone(), s2.clone()),
                 (NO::SignedBy, &[s1, s2], OA::Signature(sig)) => {
                     Self::SignedBy(s1.clone(), s2.clone(), sig)
+                }
+                (NO::EncryptionOf, &[s1, s2, s3], OA::SecretKey(sk)) => {
+                    Self::EncryptionOf(s1.clone(), s2.clone(), s3.clone(), sk)
                 }
                 (
                     NO::ContainerInsertFromEntries,
@@ -422,6 +434,28 @@ impl Operation {
         Ok(sig.verify(pk, msg.raw()))
     }
 
+    pub(crate) fn check_encryption_of(
+        pk: &Value,
+        ct: &Value,
+        pt: &Value,
+        sender_sk: &SecretKey,
+    ) -> Result<bool> {
+        let sender_pk = sender_sk.public_key().as_fields();
+        let pk = ok_or_type_err(pk.as_public_key(), pk, "PublicKey")?;
+        let ct = ok_or_type_err(ct.as_ciphertext(), ct, "Ciphertext")?;
+        let pt = ok_or_type_err(
+            pt.as_plaintext(),
+            pt,
+            "Plaintext
+",
+        )?;
+        let nonce = std::array::from_fn(|i| ct[i]);
+
+        let expected_ct = encrypt_fields(nonce, sender_sk, pk, pt)?;
+
+        Ok(sender_pk == expected_ct[2..12] && expected_ct == ct)
+    }
+
     /// Checks the given operation against a statement.
     pub fn check(&self, params: &Params, output_statement: &Statement) -> Result<bool> {
         use Statement::*;
@@ -479,6 +513,14 @@ impl Operation {
             }
             (Self::SignedBy(msg_s, pk_s, sig), SignedBy(msg_v, pk_v)) => {
                 Self::check_signed_by(&val(msg_v, msg_s)?, &val(pk_v, pk_s)?, sig)?
+            }
+            (Self::EncryptionOf(pk_s, ct_s, pt_s, sk), EncryptionOf(pk_v, ct_v, pt_v)) => {
+                Self::check_encryption_of(
+                    &val(pk_v, pk_s)?,
+                    &val(ct_v, ct_s)?,
+                    &val(pt_v, pt_s)?,
+                    sk,
+                )?
             }
             (
                 Self::ContainerInsertFromEntries(new_root_s, old_root_s, key_s, val_s, pf),
@@ -817,9 +859,10 @@ pub(crate) fn value_from_op(input_st: &Statement, output_ref: &ValueRef) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{array, collections::HashMap};
 
     use num::BigUint;
+    use plonky2::field::types::Field;
 
     use crate::{
         backends::plonky2::{
@@ -829,7 +872,10 @@ mod tests {
             },
             signer::Signer,
         },
-        middleware::{hash_value, Error, Operation, Params, Result, Signer as _, Statement, Value},
+        middleware::{
+            encrypt_fields, hash_value, Error, Operation, Params, Result, Signer as _, Statement,
+            TypedValue, Value, PT_LEN,
+        },
     };
 
     #[test]
@@ -1083,6 +1129,32 @@ mod tests {
 
         let op = Operation::SignedBy(Statement::None, Statement::None, sig);
         let st = Statement::SignedBy(msg.into(), pk.into());
+        op.check(&params, &st)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_encryption_of_op() -> Result<()> {
+        use crate::middleware::basetypes::F;
+        let params = Params::default();
+
+        let sk = SecretKey(BigUint::from(0x1234567890abcdefu64));
+        let sender_sk = SecretKey(BigUint::from(0x4242424269696969u64));
+
+        let pk = sk.public_key();
+        let pt_vec = (0..)
+            .map(|i| F::from_canonical_u64(i))
+            .take(PT_LEN)
+            .collect::<Vec<_>>();
+        let pt = Value::from(TypedValue::Plaintext(pt_vec.clone()));
+        let nonce = [F(42), F(42)];
+        let ct_vec = encrypt_fields(nonce, &sender_sk, pk, pt_vec)?;
+        let ct = Value::from(TypedValue::Ciphertext(ct_vec));
+
+        let op =
+            Operation::EncryptionOf(Statement::None, Statement::None, Statement::None, sender_sk);
+        let st = Statement::EncryptionOf(pk.into(), ct.into(), pt.into());
         op.check(&params, &st)?;
 
         Ok(())

@@ -88,6 +88,10 @@ pub struct StatementCost {
     /// Limit: `params.max_public_key_of`
     pub public_key_of: usize,
 
+    /// Number of EncryptionOf operations.
+    /// Limit: `params.max_encryption_of`
+    pub encryption_of: usize,
+
     /// Custom predicate batches used (for batch cardinality constraint).
     /// Limit: `params.max_custom_predicate_batches` distinct batches per POD.
     pub custom_batch_ids: BTreeSet<CustomBatchId>,
@@ -141,6 +145,10 @@ impl StatementCost {
                     // PublicKeyOf operation
                     NativeOperation::PublicKeyOf => {
                         cost.public_key_of = 1;
+                    }
+
+                    NativeOperation::EncryptionOf => {
+                        cost.encryption_of = 1;
                     }
 
                     // Operations with no special resource costs

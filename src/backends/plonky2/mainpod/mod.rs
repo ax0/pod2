@@ -1,12 +1,14 @@
 pub mod operation;
-use crate::middleware::{wildcard_values_from_op_st, PodType};
+use crate::middleware::{
+    encrypt_fields, wildcard_values_from_op_st, Ciphertext, Plaintext, PodType, PT_LEN,
+};
 pub mod statement;
 use std::iter;
 
 use itertools::{zip_eq, Itertools};
 use num_bigint::BigUint;
 pub use operation::*;
-use plonky2::{hash::poseidon::PoseidonHash, plonk::config::Hasher};
+use plonky2::{field::types::Field, hash::poseidon::PoseidonHash, plonk::config::Hasher};
 use serde::{Deserialize, Serialize};
 pub use statement::*;
 
@@ -300,6 +302,75 @@ pub(crate) fn extract_signatures(
     Ok(table)
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EncryptionOf {
+    pub pk: PublicKey,
+    pub pt: Plaintext,
+    pub ct: Ciphertext,
+    pub sender_sk: SecretKey,
+}
+
+impl EncryptionOf {
+    /// A valid deterministic signature from a known private key and nonce, used for padding
+    pub fn dummy() -> Self {
+        let sk = SecretKey(BigUint::from(1u32));
+        let pk = sk.public_key();
+        let pt: Vec<_> = std::iter::repeat(F::ZERO).take(PT_LEN).collect();
+        let nonce = [F::ZERO, F::ZERO];
+        let ct = encrypt_fields(nonce, &sk, pk, pt.clone()).unwrap();
+
+        Self {
+            pk,
+            pt,
+            ct,
+            sender_sk: sk,
+        }
+    }
+}
+
+/// Extracts encryption verification data from EncryptionOf ops.
+pub(crate) fn extract_encryption(
+    params: &Params,
+    aux_list: &mut [OperationAux],
+    operations: &[middleware::Operation],
+    statements: &[middleware::Statement],
+) -> Result<Vec<EncryptionOf>> {
+    let mut table = Vec::new();
+    for (i, (op, st)) in operations.iter().zip(statements.iter()).enumerate() {
+        let deduction_err = || MiddlewareError::invalid_deduction(op.clone(), st.clone());
+        if let (
+            middleware::Operation::EncryptionOf(pk_s, pt_s, ct_s, sk),
+            middleware::Statement::EncryptionOf(pk_ref, pt_ref, ct_ref),
+        ) = (op, st)
+        {
+            let pk = value_from_op(pk_s, pk_ref).ok_or_else(deduction_err)?;
+            let pt = value_from_op(pt_s, pt_ref).ok_or_else(deduction_err)?;
+            let ct = value_from_op(ct_s, ct_ref).ok_or_else(deduction_err)?;
+            aux_list[i] = OperationAux::EncryptionOfIndex(table.len());
+            table.push(EncryptionOf {
+                pk: pk
+                    .as_public_key()
+                    .ok_or_else(|| Error::custom(format!("{pk} is not PublicKey")))?,
+                pt: pt
+                    .as_plaintext()
+                    .ok_or_else(|| Error::custom(format!("{pt} is not Plaintext")))?,
+                ct: ct
+                    .as_ciphertext()
+                    .ok_or_else(|| Error::custom(format!("{ct} is not Ciphertext")))?,
+                sender_sk: sk.clone(),
+            });
+        }
+    }
+    if table.len() > params.max_encryption_of {
+        return Err(Error::custom(format!(
+            "The number of required encryptions ({}) exceeds the maximum number ({}).",
+            table.len(),
+            params.max_encryption_of
+        )));
+    }
+    Ok(table)
+}
+
 /// Find the operation argument statement in the list of previous statements and return the index.
 fn find_op_arg(statements: &[Statement], op_arg: &middleware::Statement) -> Result<OperationArg> {
     // NOTE: The `None` `Statement` always exists as a constant at index 0
@@ -520,6 +591,8 @@ impl MainPodProver for Prover {
             extract_public_key_of(params, &mut aux_list, inputs.operations, inputs.statements)?;
         let signed_bys =
             extract_signatures(params, &mut aux_list, inputs.operations, inputs.statements)?;
+        let encryption_ofs =
+            extract_encryption(params, &mut aux_list, inputs.operations, inputs.statements)?;
 
         let merkle_tree_state_transition_proofs =
             extract_merkle_tree_state_transition_proofs(params, &mut aux_list, inputs.operations)?;
@@ -582,6 +655,7 @@ impl MainPodProver for Prover {
             merkle_proofs,
             public_key_of_sks,
             signed_bys,
+            encryption_ofs,
             merkle_tree_state_transition_proofs,
             custom_predicates_with_mpt_proofs,
             custom_predicate_verifications,
@@ -1000,6 +1074,7 @@ pub mod tests {
     #[test]
     fn test_mainpod_small_empty() {
         let params = middleware::Params {
+            max_encryption_of: 0,
             max_signed_by: 0,
             max_input_pods: 0,
             max_input_pods_public_statements: 2,
